@@ -1,5 +1,6 @@
 #include "MS5837.h"
-#include <Wire.h>
+#include "pico/binary_info.h"
+#include <math.h>
 
 const uint8_t MS5837_ADDR = 0x76;
 const uint8_t MS5837_RESET = 0x1E;
@@ -20,33 +21,50 @@ const uint8_t MS5837_02BA01 = 0x00; // Sensor version: From MS5837_02BA datashee
 const uint8_t MS5837_02BA21 = 0x15; // Sensor version: From MS5837_02BA datasheet Version PROM Word 0
 const uint8_t MS5837_30BA26 = 0x1A; // Sensor version: From MS5837_30BA datasheet Version PROM Word 0
 
-MS5837::MS5837() {
-	fluidDensity = 1029;
+MS5837::MS5837():
+	I2C_BUS			(NULL), // init() must be called to choose hardware i2c bus
+	SDA_PIN			(4),	// sda and scl are initialized to "safe" pins for i2c0, but are reset by init()
+	SCL_PIN			(5),
+	baudrate		(100*1000),
+	fluidDensity	(1029) {}
+
+
+bool MS5837::begin(i2c_inst_t* I2C_BUS, uint8_t SDA_PIN, uint8_t SCL_PIN) {
+	return (init(I2C_BUS, SDA_PIN, SCL_PIN));
 }
 
-bool MS5837::begin(TwoWire &wirePort) {
-	return (init(wirePort));
-}
+bool MS5837::init(i2c_inst_t* I2C_BUS, uint8_t SDA_PIN, uint8_t SCL_PIN) {
+	//Grab which port the user wants us to use
+	this->I2C_BUS = I2C_BUS;
+	this->SDA_PIN = SDA_PIN;
+	this->SCL_PIN = SCL_PIN;
 
-bool MS5837::init(TwoWire &wirePort) {
-	_i2cPort = &wirePort; //Grab which port the user wants us to use
+	// initialize i2c bus and set pullup resistors
+	i2c_init(I2C_BUS, baudrate);
+    gpio_set_function(SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(SDA_PIN);
+    gpio_pull_up(SCL_PIN);
 
+	// Make i2c pins visible to picotool
+	 bi_decl(bi_2pins_with_func(SDA_PIN, SCL_PIN, GPIO_FUNC_I2C));
+ 
 	// Reset the MS5837, per datasheet
-	_i2cPort->beginTransmission(MS5837_ADDR);
-	_i2cPort->write(MS5837_RESET);
-	_i2cPort->endTransmission();
+	
+	uint8_t data = MS5837_RESET;
+	i2c_write_blocking(I2C_BUS, MS5837_ADDR, &data, sizeof(data), false);
 
 	// Wait for reset to complete
-	delay(10);
+	sleep_ms(10);
 
 	// Read calibration values and CRC
 	for ( uint8_t i = 0 ; i < 7 ; i++ ) {
-		_i2cPort->beginTransmission(MS5837_ADDR);
-		_i2cPort->write(MS5837_PROM_READ+i*2);
-		_i2cPort->endTransmission();
+		data = MS5837_PROM_READ + i*2;
+		i2c_write_timeout_us(I2C_BUS, MS5837_ADDR, &data, sizeof(data), false, 100*1000);
 
-		_i2cPort->requestFrom(MS5837_ADDR,2);
-		C[i] = (_i2cPort->read() << 8) | _i2cPort->read();
+		uint8_t buf[2] = {0};
+		i2c_read_timeout_us(I2C_BUS, MS5837_ADDR, buf, sizeof(buf), false, 100*1000);
+		C[i] = (buf[0] << 8 | buf[1]);
 	}
 
 	// Verify that data is correct with CRC
@@ -97,44 +115,42 @@ void MS5837::setFluidDensity(float density) {
 
 void MS5837::read() {
 	//Check that _i2cPort is not NULL (i.e. has the user forgoten to call .init or .begin?)
-	if (_i2cPort == NULL)
+	if (I2C_BUS == NULL)
 	{
 		return;
 	}
 
 	// Request D1 conversion
-	_i2cPort->beginTransmission(MS5837_ADDR);
-	_i2cPort->write(MS5837_CONVERT_D1_8192);
-	_i2cPort->endTransmission();
+	uint8_t data = MS5837_CONVERT_D1_8192;
+	i2c_write_timeout_us(I2C_BUS, MS5837_ADDR, &data, sizeof(data), false, 100*1000);
+ 
+	sleep_ms(20); // Max conversion time per datasheet
 
-	delay(20); // Max conversion time per datasheet
+	data = MS5837_ADC_READ;
+	i2c_write_timeout_us(I2C_BUS, MS5837_ADDR, &data, sizeof(data), false, 100*1000);
+	uint8_t buf[3] = {0};
+	i2c_read_timeout_us(I2C_BUS, MS5837_ADDR, buf, sizeof(buf), false, 100*1000);
 
-	_i2cPort->beginTransmission(MS5837_ADDR);
-	_i2cPort->write(MS5837_ADC_READ);
-	_i2cPort->endTransmission();
-
-	_i2cPort->requestFrom(MS5837_ADDR,3);
 	D1_pres = 0;
-	D1_pres = _i2cPort->read();
-	D1_pres = (D1_pres << 8) | _i2cPort->read();
-	D1_pres = (D1_pres << 8) | _i2cPort->read();
+	D1_pres = buf[0];
+	D1_pres = (D1_pres << 8) | buf[1];
+	D1_pres = (D1_pres << 8) | buf[2];
 
 	// Request D2 conversion
-	_i2cPort->beginTransmission(MS5837_ADDR);
-	_i2cPort->write(MS5837_CONVERT_D2_8192);
-	_i2cPort->endTransmission();
 
-	delay(20); // Max conversion time per datasheet
+	data = MS5837_CONVERT_D2_8192;
+	i2c_write_timeout_us(I2C_BUS, MS5837_ADDR, &data, sizeof(data), false, 100*1000);
 
-	_i2cPort->beginTransmission(MS5837_ADDR);
-	_i2cPort->write(MS5837_ADC_READ);
-	_i2cPort->endTransmission();
+	sleep_ms(20); // Max conversion time per datasheet
 
-	_i2cPort->requestFrom(MS5837_ADDR,3);
+	data = MS5837_ADC_READ;
+	i2c_write_timeout_us(I2C_BUS, MS5837_ADDR, &data, sizeof(data), false, 100*1000);
+	i2c_read_timeout_us(I2C_BUS, MS5837_ADDR, buf, sizeof(buf), false, 100*1000);
+
 	D2_temp = 0;
-	D2_temp = _i2cPort->read();
-	D2_temp = (D2_temp << 8) | _i2cPort->read();
-	D2_temp = (D2_temp << 8) | _i2cPort->read();
+	D2_temp = buf[0];
+	D2_temp = (D2_temp << 8) | buf[1];
+	D2_temp = (D2_temp << 8) | buf[2];
 
 	calculate();
 }
